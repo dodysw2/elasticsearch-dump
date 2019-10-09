@@ -21,6 +21,7 @@ Tools for moving and saving indices.
 - Version `2.1.0` of Elasticdump moves from using `scan/scroll` (ES 1.x) to just `scan` (ES 2.x).  This is a backwards-compatible change within Elasticsearch, but performance may suffer on Elasticsearch versions prior to 2.x.
 - Version `3.0.0` of Elasticdump has the default queries updated to only work for ElasticSearch version 5+.  The tool *may* be compatible with earlier versions of Elasticsearch, but our version detection method may not work for all ES cluster topologies
 - Version `5.0.0` of Elasticdump contains a breaking change for the s3 transport. _s3Bucket_ and _s3RecordKey_ params are no longer supported please use s3urls instead
+- Version `6.1.0` and higher of Elasticdump contains a change to the upload/dump process. This change allows for overlapping promise processing. The benefit of which is improved performance due increased parallel processing, but a side-effect exists where-by records (data-set) aren't processing in sequential order (ordering is no longer guaranteed)
 
 ## Installing
 
@@ -131,11 +132,15 @@ elasticdump \
 
 # Import data from S3 into ES (using s3urls)
 elasticdump \
+  --s3AccessKeyId "${access_key_id}" \
+  --s3SecretAccessKey "${access_key_secret}" \
   --input "s3://${bucket_name}/${file_name}.json" \
   --output=http://production.es.com:9200/my_index
 
 # Export ES data to S3 (using s3urls)
 elasticdump \
+  --s3AccessKeyId "${access_key_id}" \
+  --s3SecretAccessKey "${access_key_secret}" \
   --input=http://production.es.com:9200/my_index \
   --output "s3://${bucket_name}/${file_name}.json"
 ```
@@ -156,14 +161,6 @@ Elasticsearch:
 elasticdump \
   --input=http://es.com:9200/api/search \
   --input-index=my_index \
-  --output=http://es.com:9200/api/search \
-  --output-index=my_index \
-  --type=mapping
-
-# Copy a single type:
-elasticdump \
-  --input=http://es.com:9200/api/search \
-  --input-index=my_index/my_type \
   --output=http://es.com:9200/api/search \
   --output-index=my_index \
   --type=mapping
@@ -241,6 +238,9 @@ Usage: elasticdump --input SOURCE --output DESTINATION [OPTIONS]
 --output-index
                     Destination index and type
                     (default: all, example: index/type)
+--overwrite
+                    Overwrite output file if it exists
+                    (default: false)                    
 --limit
                     How many objects to move in batch per operation
                     limit is approximate for file streams
@@ -248,6 +248,26 @@ Usage: elasticdump --input SOURCE --output DESTINATION [OPTIONS]
 --size
                     How many objects to retrieve
                     (default: -1 -> no limit)
+--concurrency
+                    The maximum number of requests the can be made concurrently to a specified transport.
+                    (default: 1)       
+--concurrencyInterval
+                    The length of time in milliseconds in which up to <intervalCap> requests can be made
+                    before the interval request count resets. Must be finite.
+                    (default: 5000)       
+--intervalCap
+                    The maximum number of transport requests that can be made within a given <concurrencyInterval>.
+                    (default: 5)
+--carryoverConcurrencyCount
+                    If true, any incomplete requests from a <concurrencyInterval> will be carried over to
+                    the next interval, effectively reducing the number of new requests that can be created
+                    in that next interval.  If false, up to <intervalCap> requests can be created in the
+                    next interval regardless of the number of incomplete requests from the previous interval.
+                    (default: true)                                                                                       
+--throttleInterval
+                    Delay in milliseconds between getting data from an inputTransport and sending it to an
+                    outputTransport.
+                     (default: 1)
 --debug
                     Display the elasticsearch commands being used
                     (default: false)
@@ -384,15 +404,29 @@ Usage: elasticdump --input SOURCE --output DESTINATION [OPTIONS]
                     e.g. 10mb / 1gb / 1tb
                     Partitioning helps to alleviate overflow/out of memory exceptions by efficiently segmenting files
                     into smaller chunks that then be merged if needs be.
-
+--fsCompress
+                    gzip data before sending outputting to file 
 --s3AccessKeyId
                     AWS access key ID
 --s3SecretAccessKey
                     AWS secret access key
 --s3Region
                     AWS region
+--s3Endpoint        
+                    AWS endpoint can be used for AWS compatible backends such as
+                    OpenStack Swift and OpenStack Ceph
+--s3SSLEnabled      
+                    Use SSL to connect to AWS [default true]
+                    
+--s3ForcePathStyle  Force path style URLs for S3 objects [default false]
+                    
 --s3Compress
                     gzip data before sending to s3  
+
+--retryDelayBase
+                    The base number of milliseconds to use in the exponential backoff for operation retries. (s3)
+--customBackoff
+                    Activate custom customBackoff function. (s3)
 --tlsAuth
                     Enable TLS X509 client authentication
 --cert, --input-cert, --output-cert
@@ -460,9 +494,32 @@ For loading files that you have dumped from multi-elasticsearch, `--direction` s
 
 `--ignoreType` allows a type to be ignored from the dump/load. Six options are supported. `data,mapping,analyzer,alias,settings,template`. Multi-type support is available, when used each type must be comma(,)-separated
 and `interval` allows control over the interval for spawning a dump/load for a new index. For small indices this can be set to `0` to reduce delays and optimize performance
+i.e analyzer,alias types are ignored by default
 
 New options, `--suffix` allows you to add a suffix to the index name being created e.g. `es6-${index}` and
-`--prefix` allows you to add a prefix to the index name e.g. `$index}-backup-2018-03-13`.
+`--prefix` allows you to add a prefix to the index name e.g. `${index}-backup-2018-03-13`.
+
+## Usage Examples
+
+```bash
+
+# backup ES indices & all their type to the es_backup folder
+multielasticdump \
+  --direction=dump \
+  --match='^.*$'
+  --input=http://production.es.com:9200 \
+  --output=/tmp/es_backup
+
+# Only backup ES indices ending with a prefix of `-index` (match regex). 
+# Only the indices data will be backed up. All other types are ignored.
+# NB: analyzer & alias types are ignored by default
+multielasticdump \
+  --direction=dump \
+  --match='^.*-index$'
+  --input=http://production.es.com:9200 \
+  --ignoreType='mapping,settings,template'
+  --output=/tmp/es_backup
+```
 
 ## Module Transform
 
@@ -489,13 +546,15 @@ An example transform for anonymizing data on-the-fly can be found in the `transf
 - when exporting from elasticsearch, you can have export an entire index (`--input="http://localhost:9200/index"`) or a type of object from that index (`--input="http://localhost:9200/index/type"`).  This requires ElasticSearch 1.2.0 or higher
 - If elasticsearch is in a sub-directory, index and type must be provided with a separate argument (`--input="http://localhost:9200/sub/directory --input-index=index/type"`). Using `--input-index=/` will include all indices and types.
 - we are using the `put` method to write objects.  This means new objects will be created and old objects with the same ID will be updated
-- the `file` transport will not overwrite any existing files, it will throw an exception of the file already exists
+- The `file` transport will not overwrite any existing files by default, it will throw an exception of the file already exists. Use `--overwrite` instead.
 - If you need basic http auth, you can use it like this: `--input=http://name:password@production.es.com:9200/my_index`
 - if you choose a stdio output (`--output=$`), you can also request a more human-readable output with `--format=human`
 - if you choose a stdio output (`--output=$`), all logging output will be suppressed
 - if you are using Elasticsearch version 6.0.0 or higher the `offset` parameter is no longer allowed in the scrollContext
 - ES 6.x.x & higher no longer support the `template` property for `_template` all templates prior to ES 6.0 has to be upgraded to use `index_patterns`
 - ES 7.x.x & higher no longer supports `type` property. all templates prior to ES 6.0 has to be upgraded to remove the type property
+- ES 5.x.x ignores offset (from) parameter in the search body. All records will be returned
+- ES 6.x.x [from](https://www.elastic.co/guide/en/elasticsearch/reference/6.8/breaking-changes-6.0.html#_scroll) parameter can no longer be used in the search request body when initiating a scroll
 
 Inspired by https://github.com/crate/elasticsearch-inout-plugin and https://github.com/jprante/elasticsearch-knapsack
 

@@ -41,9 +41,11 @@ const defaults = {
   s3AccessKeyId: null,
   s3SecretAccessKey: null,
   s3Region: null,
-  s3Bucket: null,
-  s3RecordKey: null,
+  s3Endpoint: null,
+  s3SSLEnabled: true,
+  s3ForcePathStyle: false,
   s3Compress: false,
+  fsCompress: false,
   awsIniFileName: null,
   sessionToken: null,
   transform: null,
@@ -52,6 +54,8 @@ const defaults = {
   prefix: '',
   suffix: '',
   retryAttempts: 0,
+  customBackoff: false,
+  retryDelayBase: 0,
   retryDelay: 5000,
   parseExtraFields: '',
   fileSize: -1,
@@ -71,7 +75,13 @@ const defaults = {
   inputSocksProxy: null,
   inputSocksPort: null,
   outputSocksProxy: null,
-  outputSocksPort: null
+  outputSocksPort: null,
+  concurrency: 1,
+  throttleInterval: 1,
+  carryoverConcurrencyCount: true,
+  intervalCap: 5,
+  concurrencyInterval: 5000,
+  overwrite: false
 }
 const jsonParsedOpts = ['searchBody', 'headers', 'params']
 const options = {}
@@ -82,6 +92,7 @@ for (const i in defaults) {
 
   if (options[i] === 'true') { options[i] = true }
   if (options[i] === 'false') { options[i] = false }
+  if (options[i] === 'Infinity') { options[i] = Infinity }
   if (options[i] === 'null') { options[i] = null }
 }
 
@@ -117,8 +128,9 @@ if (argv.help === true) {
 } else if (argv.version === true) {
   console.log(packageData.version)
 } else {
-  if (options.output !== '$' && !isUrl(options.output) && fs.existsSync(options.output)) {
-    throw new Error(`File \`${options.output}\` already exists, quitting`)
+  if (!options.overwrite && options.output !== '$' && !isUrl(options.output) && fs.existsSync(options.output)) {
+    console.error(`File \`${options.output}\` already exists, quitting`)
+    process.exit(1)
   }
 
   const dumper = new Elasticdump(options.input, options.output, options)
