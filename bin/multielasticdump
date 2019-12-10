@@ -6,13 +6,13 @@
 // dump --input must be a URL and --output must be a path on this system
 // index --input must be a a path on this system --output must be URL
 
-const argv = require('optimist').argv
+const { argv } = require('optimist')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const async = require('async')
 const request = require('request')
-const fork = require('child_process').fork
+const { fork } = require('child_process')
 const _ = require('lodash')
 
 const options = {}
@@ -45,6 +45,7 @@ const defaults = {
   ignoreTemplate: false,
   ignoreAlias: true,
   ignoreType: [],
+  includeType: null,
   interval: 1000,
   prefix: '',
   suffix: '',
@@ -64,10 +65,10 @@ const defaults = {
   'output-key': null,
   'output-pass': null,
   'output-ca': null,
-  concurrency: null,
-  carryoverConcurrencyCount: false,
-  intervalCap: null,
-  concurrencyInterval: 0,
+  concurrency: 1,
+  carryoverConcurrencyCount: true,
+  intervalCap: 5,
+  concurrencyInterval: 5000,
   overwrite: false,
   fsCompress: false
 }
@@ -92,6 +93,14 @@ _.split(options.ignoreType, ',').forEach(field => {
     options[key] = true
   }
 })
+
+if (options.includeType) {
+  const ignoreKeys = _.keys(options).filter((key) => key.startsWith('ignore'))
+  const includedKeys = _.split(options.includeType, ',')
+  ignoreKeys.forEach(k => {
+    options[k] = _.indexOf(includedKeys, _.toLower(/^ignore(.*)$/.exec(k)[1])) <= -1
+  })
+}
 
 const commonParams = [
   `--headers=${options.headers}`,
@@ -150,6 +159,20 @@ const validateDirectory = (options, field) => {
     console.error(`--${field} ${options[field]} is a not directory`)
     process.exit(1)
   }
+}
+
+const _fork = (params = [], file = 'elasticdump') => {
+  return fork(path.join(__dirname, file), params.concat(commonParams))
+}
+
+const attachListeners = (clazz, cb) => {
+  clazz.on('close', code => {
+    if (code !== 0) {
+      return cb(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
+    } else {
+      return cb()
+    }
+  }).on('error', error => log('error', error))
 }
 
 if (!options.input) { throw new Error('--input is required') }
@@ -257,95 +280,65 @@ const dump = () => {
     if (options.ignoreTemplate) return done()
     log('info', `dumping ${input} to ${outputTemplate}`)
 
-    const mappingSettings = fork(path.join(__dirname, 'elasticdump'), [
+    const templateChild = _fork([
       '--type=template',
       `--input=${input}`,
       `--output=${outputTemplate}`
-    ].concat(commonParams))
+    ])
 
-    mappingSettings.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(templateChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreSettings) return done()
     log('info', `dumping ${input} to ${outputSettings}`)
 
-    const mappingSettings = fork(path.join(__dirname, 'elasticdump'), [
+    const settingsChild = _fork([
       '--type=settings',
       `--input=${input}`,
       `--output=${outputSettings}`
-    ].concat(commonParams))
+    ])
 
-    mappingSettings.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(settingsChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreMapping) return done()
     log('info', `dumping ${input} to ${outputMapping}`)
 
-    const mappingChild = fork(path.join(__dirname, 'elasticdump'), [
+    const mappingChild = _fork([
       '--type=mapping',
       `--input=${input}`,
       `--output=${outputMapping}`
-    ].concat(commonParams))
+    ])
 
-    mappingChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(mappingChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreAnalyzer) return done()
     log('info', `analyzer ${input} to ${outputAnalyzer}`)
 
-    const analyzerChild = fork(path.join(__dirname, 'elasticdump'), [
+    const analyzerChild = _fork([
       '--type=analyzer',
       `--input=${input}`,
       `--output=${outputAnalyzer}`
-    ].concat(commonParams))
+    ])
 
-    analyzerChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(analyzerChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreAlias) return done()
     log('info', `analyzer ${input} to ${outputAlias}`)
 
-    const aliasChild = fork(path.join(__dirname, 'elasticdump'), [
+    const aliasChild = _fork([
       '--type=alias',
       `--input=${input}`,
       `--output=${outputAlias}`
-    ].concat(commonParams))
+    ])
 
-    aliasChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(aliasChild, done)
   })
 
   jobs.push(done => {
@@ -364,7 +357,7 @@ const dump = () => {
         .value()
     }
 
-    const dataChild = fork(path.join(__dirname, 'elasticdump'), [
+    const dataChild = _fork([
       '--type=data',
       `--input=${input}`,
       `--output=${outputData}`,
@@ -375,15 +368,9 @@ const dump = () => {
       `--prefix=${options.prefix}`,
       `--suffix=${options.suffix}`,
       `--support-big-int=${options['support-big-int']}`
-    ].concat(_transform).concat(commonParams))
+    ].concat(_transform))
 
-    dataChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(dataChild, done)
   })
 
   async.series(jobs, error => {
@@ -424,11 +411,11 @@ const load = () => {
     if (options.ignoreTemplate) return done()
     log('info', `indexing template ${inputTemplate} to ${output}`)
 
-    const templateChild = fork(path.join(__dirname, 'elasticdump'), [
+    const templateChild = _fork([
       '--type=template',
       `--input=${inputTemplate}`,
       `--output=${output}`
-    ].concat(commonParams))
+    ])
 
     templateChild.on('close', code => {
       if (code !== 0) {
@@ -436,83 +423,59 @@ const load = () => {
       } else {
         return done()
       }
-    })
+    }).on('error', error => log('error', error))
   })
 
   jobs.push(done => {
     if (options.ignoreSettings) return done()
     log('info', `indexing settings ${inputSettings} to ${output}`)
 
-    const settingsChild = fork(path.join(__dirname, 'elasticdump'), [
+    const settingsChild = _fork([
       '--type=settings',
       `--input=${inputSettings}`,
       `--output=${output}`
-    ].concat(commonParams))
+    ])
 
-    settingsChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(settingsChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreAnalyzer) return done()
     log('info', `indexing analyzer ${inputAnalyzer} to ${output}`)
 
-    const analyzerChild = fork(path.join(__dirname, 'elasticdump'), [
+    const analyzerChild = _fork([
       '--type=analyzer',
       `--input=${inputAnalyzer}`,
       `--output=${output}`
-    ].concat(commonParams))
+    ])
 
-    analyzerChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(analyzerChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreMapping) return done()
     log('info', `indexing mapping ${inputMapping} to ${output}`)
 
-    const mappingChild = fork(path.join(__dirname, 'elasticdump'), [
+    const mappingChild = _fork([
       '--type=mapping',
       `--input=${inputMapping}`,
       `--output=${output}`
-    ].concat(commonParams))
+    ])
 
-    mappingChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(mappingChild, done)
   })
 
   jobs.push(done => {
     if (options.ignoreAlias) return done()
     log('info', `indexing alias ${inputAlias} to ${output}`)
 
-    const aliasChild = fork(path.join(__dirname, 'elasticdump'), [
+    const aliasChild = _fork([
       '--type=alias',
       `--input=${inputAlias}`,
       `--output=${output}`
-    ].concat(commonParams))
+    ])
 
-    aliasChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(aliasChild, done)
   })
 
   jobs.push(done => {
@@ -531,7 +494,7 @@ const load = () => {
         .value()
     }
 
-    const dataChild = fork(path.join(__dirname, 'elasticdump'), [
+    const dataChild = _fork([
       '--type=data',
       `--input=${inputData}`,
       `--output=${output}`,
@@ -542,15 +505,9 @@ const load = () => {
       `--prefix=${options.prefix}`,
       `--suffix=${options.suffix}`,
       `--support-big-int=${options['support-big-int']}`
-    ].concat(_transform).concat(commonParams))
+    ].concat(_transform))
 
-    dataChild.on('close', code => {
-      if (code !== 0) {
-        return done(new Error('CHILD PROCESS EXITED WITH ERROR.  Stopping process'))
-      } else {
-        return done()
-      }
-    })
+    attachListeners(dataChild, done)
   })
 
   async.series(jobs, error => {
